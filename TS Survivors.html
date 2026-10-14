@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TS Survivors</title><style>html,body{height:100%;margin:0;background:#14161c;overflow:hidden}canvas{display:block}</style></head>
+<body><canvas id="c"></canvas><script>
+"use strict";
+/**
+ * @file game.ts
+ * @brief Survivor-like (estilo Vampire Survivors) con POO en TypeScript.
+ *
+ * Mantiene la idea de composición del ejemplo en C++: el Player se compone
+ * de Weapon[] y un Skill. A diferencia de C++, en TypeScript los objetos se
+ * guardan por referencia, lo que permite polimorfismo sin punteros.
+ */
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const rand = (a, b) => a + Math.random() * (b - a);
+function circle(ctx, x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+}
+/** @class Entity @brief Clase base abstracta de todo objeto del mundo. */
+class Entity {
+    /** @param x Posición X. @param y Posición Y. @param radius Radio de colisión. */
+    constructor(x, y, radius) {
+        this.x = x;
+        this.y = y;
+        this.radius = radius;
+        this.alive = true;
+    }
+}
+/** @class Enemy @brief Enemigo que persigue al jugador y suelta gemas al morir. */
+class Enemy extends Entity {
+    constructor(x, y, hp, speed, contactDamage) {
+        super(x, y, 11);
+        this.hp = hp;
+        this.speed = speed;
+        this.contactDamage = contactDamage;
+    }
+    update(dt, game) {
+        const p = game.player;
+        const d = dist(this, p) || 1;
+        this.x += ((p.x - this.x) / d) * this.speed * dt;
+        this.y += ((p.y - this.y) / d) * this.speed * dt;
+    }
+    /** @brief Resta vida; si muere suelta una gema. @param amount Daño recibido. @param game Juego. */
+    takeDamage(amount, game) {
+        this.hp -= amount;
+        if (this.hp <= 0 && this.alive) {
+            this.alive = false;
+            game.kills++;
+            game.add(new Gem(this.x, this.y, 1));
+        }
+    }
+    draw(ctx) { circle(ctx, this.x, this.y, this.radius, '#c0392b'); }
+}
+/** @class Gem @brief Gema de experiencia atraída por el jugador. */
+class Gem extends Entity {
+    constructor(x, y, value) {
+        super(x, y, 5);
+        this.value = value;
+    }
+    update(dt, game) {
+        const p = game.player;
+        const d = dist(this, p) || 1;
+        if (d < p.pickupRange) {
+            this.x += ((p.x - this.x) / d) * 420 * dt;
+            this.y += ((p.y - this.y) / d) * 420 * dt;
+        }
+        if (d < p.radius + this.radius) {
+            this.alive = false;
+            p.addXp(this.value, game);
+        }
+    }
+    draw(ctx) { circle(ctx, this.x, this.y, this.radius, '#3dd6d0'); }
+}
+/** @class Projectile @brief Proyectil con perforación limitada. */
+class Projectile extends Entity {
+    constructor(x, y, vx, vy, damage, pierce) {
+        super(x, y, 5);
+        this.vx = vx;
+        this.vy = vy;
+        this.damage = damage;
+        this.pierce = pierce;
+        this.life = 2;
+        this.hit = new Set();
+    }
+    update(dt, game) {
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.life -= dt;
+        if (this.life <= 0) {
+            this.alive = false;
+            return;
+        }
+        for (const e of game.enemyList) {
+            if (e.alive && !this.hit.has(e) && dist(this, e) < this.radius + e.radius) {
+                this.hit.add(e);
+                e.takeDamage(this.damage, game);
+                if (this.pierce-- <= 0) {
+                    this.alive = false;
+                    return;
+                }
+            }
+        }
+    }
+    draw(ctx) { circle(ctx, this.x, this.y, this.radius, '#f4d35e'); }
+}
+/** @class Ring @brief Efecto visual de onda expansiva (sin daño propio). */
+class Ring extends Entity {
+    constructor(x, y, maxR) {
+        super(x, y, 0);
+        this.maxR = maxR;
+        this.t = 0;
+    }
+    update(dt) {
+        this.t += dt;
+        this.radius = this.maxR * Math.min(1, this.t / 0.3);
+        if (this.t >= 0.3)
+            this.alive = false;
+    }
+    draw(ctx) {
+        ctx.strokeStyle = '#9b8cff';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+}
+/** @class Weapon @brief Arma automática con nivel, daño escalable y cooldown. */
+class Weapon {
+    /** @param name Nombre. @param baseDamage Daño nivel 1. @param cooldown Segundos entre usos. */
+    constructor(name, baseDamage, cooldown) {
+        this.name = name;
+        this.baseDamage = baseDamage;
+        this.cooldown = cooldown;
+        this.level = 1;
+        this.timer = 0;
+    }
+    /** @brief Daño actual (+30% por nivel). */
+    get damage() { return this.baseDamage * (1 + 0.3 * (this.level - 1)); }
+    upgrade() { this.level++; }
+    draw(_ctx, _owner) { }
+}
+/** @class MagicBolt @brief Dispara proyectiles al enemigo más cercano. */
+class MagicBolt extends Weapon {
+    constructor() { super('Magic Bolt', 12, 0.8); }
+    update(dt, owner, game) {
+        this.timer -= dt;
+        if (this.timer > 0)
+            return;
+        const target = game.nearestEnemy(owner);
+        if (!target)
+            return;
+        this.timer = this.cooldown;
+        const base = Math.atan2(target.y - owner.y, target.x - owner.x);
+        for (let i = 0; i < this.level; i++) {
+            const a = base + (i - (this.level - 1) / 2) * 0.15;
+            game.add(new Projectile(owner.x, owner.y, Math.cos(a) * 450, Math.sin(a) * 450, this.damage, this.level >= 3 ? 1 : 0));
+        }
+    }
+}
+/** @class OrbitBlades @brief Cuchillas que giran alrededor del jugador. */
+class OrbitBlades extends Weapon {
+    constructor() {
+        super('Orbit Blades', 8, 0.4);
+        this.angle = 0;
+        this.lastHit = new Map();
+    }
+    positions(owner) {
+        const n = 1 + this.level;
+        return Array.from({ length: n }, (_, i) => {
+            const a = this.angle + (i * Math.PI * 2) / n;
+            return { x: owner.x + Math.cos(a) * 70, y: owner.y + Math.sin(a) * 70 };
+        });
+    }
+    update(dt, owner, game) {
+        this.angle += dt * 3;
+        const blades = this.positions(owner);
+        for (const e of game.enemyList) {
+            if (!e.alive || game.time - (this.lastHit.get(e) ?? -99) < this.cooldown)
+                continue;
+            if (blades.some(b => dist(b, e) < 9 + e.radius)) {
+                this.lastHit.set(e, game.time);
+                e.takeDamage(this.damage, game);
+            }
+        }
+        for (const e of this.lastHit.keys())
+            if (!e.alive)
+                this.lastHit.delete(e);
+    }
+    draw(ctx, owner) {
+        for (const b of this.positions(owner))
+            circle(ctx, b.x, b.y, 9, '#d0d6e0');
+    }
+}
+/** @class Skill @brief Habilidad activa con cooldown (Template Method: activate). */
+class Skill {
+    constructor(name, cooldown) {
+        this.name = name;
+        this.cooldown = cooldown;
+        this.timer = 0;
+    }
+    /** @brief Progreso de recarga entre 0 y 1. */
+    get ratio() { return 1 - Math.max(0, this.timer) / this.cooldown; }
+    update(dt) { if (this.timer > 0)
+        this.timer -= dt; }
+    tryUse(owner, game) {
+        if (this.timer > 0)
+            return;
+        this.timer = this.cooldown;
+        this.activate(owner, game);
+    }
+}
+/** @class Nova @brief Daña a todos los enemigos en un radio. */
+class Nova extends Skill {
+    constructor() { super('Nova', 8); }
+    activate(owner, game) {
+        const radius = 160;
+        game.add(new Ring(owner.x, owner.y, radius));
+        for (const e of game.enemyList)
+            if (dist(owner, e) < radius + e.radius)
+                e.takeDamage(50, game);
+    }
+}
+/** @class Player @brief Jugador compuesto por armas y una habilidad. */
+class Player extends Entity {
+    constructor(weapon, skill) {
+        super(0, 0, 12);
+        this.skill = skill;
+        this.hp = 100;
+        this.maxHp = 100;
+        this.xp = 0;
+        this.xpNext = 5;
+        this.level = 1;
+        this.speed = 160;
+        this.pickupRange = 70;
+        this.invuln = 0;
+        this.weapons = [weapon];
+    }
+    update(dt, game) {
+        const k = game.input;
+        let dx = (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
+        let dy = (k.has('KeyS') || k.has('ArrowDown') ? 1 : 0) - (k.has('KeyW') || k.has('ArrowUp') ? 1 : 0);
+        const len = Math.hypot(dx, dy) || 1;
+        this.x += (dx / len) * this.speed * dt;
+        this.y += (dy / len) * this.speed * dt;
+        this.invuln -= dt;
+        for (const w of this.weapons)
+            w.update(dt, this, game);
+        this.skill.update(dt);
+        if (k.has('Space'))
+            this.skill.tryUse(this, game);
+        if (this.invuln > 0)
+            return;
+        for (const e of game.enemyList) {
+            if (e.alive && dist(this, e) < this.radius + e.radius) {
+                this.takeDamage(e.contactDamage, game);
+                break;
+            }
+        }
+    }
+    takeDamage(n, game) {
+        this.hp = Math.max(0, this.hp - n);
+        this.invuln = 0.5;
+        if (this.hp === 0) {
+            this.alive = false;
+            game.state = 'dead';
+        }
+    }
+    addXp(v, game) {
+        this.xp += v;
+        if (this.xp >= this.xpNext) {
+            this.xp -= this.xpNext;
+            this.level++;
+            this.xpNext = Math.ceil(this.xpNext * 1.4) + 2;
+            game.openLevelUp();
+        }
+    }
+    draw(ctx) {
+        for (const w of this.weapons)
+            w.draw(ctx, this);
+        if (this.invuln > 0 && Math.floor(this.invuln * 20) % 2 === 0)
+            return;
+        circle(ctx, this.x, this.y, this.radius, '#4aa3ff');
+    }
+}
+/** @class Game @brief Bucle principal, entrada, spawn y HUD. */
+class Game {
+    constructor(canvas, ctx) {
+        this.canvas = canvas;
+        this.ctx = ctx;
+        this.entities = [];
+        this.enemyList = [];
+        this.time = 0;
+        this.kills = 0;
+        this.state = 'playing';
+        this.input = new Set();
+        this.options = [];
+        this.spawnTimer = 0;
+        this.last = 0;
+        this.frame = (t) => {
+            const dt = Math.min(0.05, (t - this.last) / 1000);
+            this.last = t;
+            this.update(dt);
+            this.draw();
+            requestAnimationFrame(this.frame);
+        };
+        const resize = () => { canvas.width = innerWidth; canvas.height = innerHeight; };
+        resize();
+        addEventListener('resize', resize);
+        addEventListener('keydown', e => {
+            if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code))
+                e.preventDefault();
+            this.input.add(e.code);
+            if (this.state === 'levelup') {
+                const i = ['Digit1', 'Digit2', 'Digit3'].indexOf(e.code);
+                if (i >= 0)
+                    this.pick(i);
+            }
+            else if (this.state === 'dead' && e.code === 'KeyR')
+                this.reset();
+        });
+        addEventListener('keyup', e => this.input.delete(e.code));
+        canvas.addEventListener('click', e => {
+            if (this.state !== 'levelup')
+                return;
+            for (let i = 0; i < this.options.length; i++) {
+                const r = this.cardRect(i);
+                if (e.offsetX >= r.x && e.offsetX <= r.x + r.w && e.offsetY >= r.y && e.offsetY <= r.y + r.h)
+                    this.pick(i);
+            }
+        });
+        this.reset();
+        requestAnimationFrame(this.frame);
+    }
+    reset() {
+        this.entities = [];
+        this.enemyList = [];
+        this.time = 0;
+        this.kills = 0;
+        this.state = 'playing';
+        this.player = new Player(new MagicBolt(), new Nova());
+    }
+    add(e) { this.entities.push(e); }
+    nearestEnemy(from) {
+        let best = null, bd = Infinity;
+        for (const e of this.enemyList) {
+            const d = dist(from, e);
+            if (e.alive && d < bd) {
+                bd = d;
+                best = e;
+            }
+        }
+        return best;
+    }
+    /** @brief Pausa el juego y ofrece 3 mejoras aleatorias. */
+    openLevelUp() {
+        const p = this.player;
+        const pool = p.weapons.map(w => ({ label: `${w.name} -> Lv ${w.level + 1}`, apply: () => w.upgrade() }));
+        for (const make of [() => new MagicBolt(), () => new OrbitBlades()]) {
+            const w = make();
+            if (!p.weapons.some(o => o.name === w.name))
+                pool.push({ label: `New: ${w.name}`, apply: () => p.weapons.push(w) });
+        }
+        pool.push({ label: '+20 max HP and heal', apply: () => { p.maxHp += 20; p.hp = p.maxHp; } }, { label: '+15% move speed', apply: () => { p.speed *= 1.15; } }, { label: '+40 pickup range', apply: () => { p.pickupRange += 40; } });
+        pool.sort(() => Math.random() - 0.5);
+        this.options = pool.slice(0, 3);
+        this.state = 'levelup';
+    }
+    pick(i) {
+        if (!this.options[i])
+            return;
+        this.options[i].apply();
+        this.state = 'playing';
+    }
+    cardRect(i) {
+        const w = 220, gap = 20, total = this.options.length * w + (this.options.length - 1) * gap;
+        return { x: (this.canvas.width - total) / 2 + i * (w + gap), y: this.canvas.height / 2 - 60, w, h: 120 };
+    }
+    spawn(dt) {
+        this.spawnTimer -= dt;
+        if (this.spawnTimer > 0 || this.enemyList.length >= 300)
+            return;
+        this.spawnTimer = Math.max(0.12, 1 - this.time / 120);
+        const a = rand(0, Math.PI * 2), r = Math.max(this.canvas.width, this.canvas.height) / 2 + 40, t = this.time;
+        this.add(new Enemy(this.player.x + Math.cos(a) * r, this.player.y + Math.sin(a) * r, 10 + t * 0.15, 55 + Math.min(60, t * 0.4), 8));
+    }
+    update(dt) {
+        if (this.state !== 'playing')
+            return;
+        this.time += dt;
+        this.enemyList = this.entities.filter((e) => e instanceof Enemy);
+        this.spawn(dt);
+        this.player.update(dt, this);
+        for (const e of this.entities)
+            e.update(dt, this);
+        this.entities = this.entities.filter(e => e.alive);
+    }
+    draw() {
+        const { ctx, canvas, player: p } = this;
+        const W = canvas.width, H = canvas.height;
+        ctx.fillStyle = '#14161c';
+        ctx.fillRect(0, 0, W, H);
+        ctx.save();
+        ctx.translate(W / 2 - p.x, H / 2 - p.y);
+        ctx.strokeStyle = '#1f2330';
+        ctx.lineWidth = 1;
+        const g = 64, x0 = Math.floor((p.x - W / 2) / g) * g, y0 = Math.floor((p.y - H / 2) / g) * g;
+        ctx.beginPath();
+        for (let x = x0; x < p.x + W / 2 + g; x += g) {
+            ctx.moveTo(x, p.y - H / 2 - g);
+            ctx.lineTo(x, p.y + H / 2 + g);
+        }
+        for (let y = y0; y < p.y + H / 2 + g; y += g) {
+            ctx.moveTo(p.x - W / 2 - g, y);
+            ctx.lineTo(p.x + W / 2 + g, y);
+        }
+        ctx.stroke();
+        for (const e of this.entities)
+            e.draw(ctx);
+        p.draw(ctx);
+        ctx.restore();
+        this.drawHud(W, H);
+    }
+    drawHud(W, H) {
+        const { ctx, player: p } = this;
+        ctx.fillStyle = '#2a2f3d';
+        ctx.fillRect(0, 0, W, 10);
+        ctx.fillStyle = '#3dd6d0';
+        ctx.fillRect(0, 0, W * (p.xp / p.xpNext), 10);
+        ctx.fillStyle = '#2a2f3d';
+        ctx.fillRect(12, 20, 200, 14);
+        ctx.fillStyle = '#c0392b';
+        ctx.fillRect(12, 20, 200 * (p.hp / p.maxHp), 14);
+        ctx.fillStyle = '#2a2f3d';
+        ctx.fillRect(12, 40, 200, 8);
+        ctx.fillStyle = '#9b8cff';
+        ctx.fillRect(12, 40, 200 * p.skill.ratio, 8);
+        ctx.fillStyle = '#e8e8ee';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`Lv ${p.level}   Kills ${this.kills}   ${p.skill.name} [Space]`, 12, 66);
+        const s = Math.floor(this.time);
+        ctx.textAlign = 'right';
+        ctx.fillText(`${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`, W - 12, 30);
+        ctx.textAlign = 'center';
+        if (this.state === 'levelup') {
+            ctx.fillStyle = 'rgba(0,0,0,.65)';
+            ctx.fillRect(0, 0, W, H);
+            ctx.fillStyle = '#fff';
+            ctx.font = '22px sans-serif';
+            ctx.fillText('Level up: choose one (click or keys 1-3)', W / 2, H / 2 - 90);
+            this.options.forEach((o, i) => {
+                const r = this.cardRect(i);
+                ctx.fillStyle = '#232838';
+                ctx.fillRect(r.x, r.y, r.w, r.h);
+                ctx.strokeStyle = '#4aa3ff';
+                ctx.strokeRect(r.x, r.y, r.w, r.h);
+                ctx.fillStyle = '#fff';
+                ctx.font = '16px sans-serif';
+                ctx.fillText(`${i + 1}. ${o.label}`, r.x + r.w / 2, r.y + r.h / 2 + 5, r.w - 16);
+            });
+        }
+        else if (this.state === 'dead') {
+            ctx.fillStyle = 'rgba(0,0,0,.7)';
+            ctx.fillRect(0, 0, W, H);
+            ctx.fillStyle = '#fff';
+            ctx.font = '28px sans-serif';
+            ctx.fillText(`You died at ${s}s with ${this.kills} kills. Press R to restart.`, W / 2, H / 2);
+        }
+    }
+}
+const canvas = document.getElementById('c');
+new Game(canvas, canvas.getContext('2d'));
+</script></body></html>
